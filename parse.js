@@ -113,7 +113,9 @@ function namedEntityEnd(s, i) {
   let j = i + 1;
   while (j < s.length) {
     const c = s.charCodeAt(j);
-    if (c === 59) return j + 1;
+    // A named entity needs at least one name character: "&;" on its
+    // own is not an entity, marked escapes the & ("&amp;;").
+    if (c === 59) return j > i + 1 ? j + 1 : -1;
     if (!isAlphaNum(c) && c !== 95) return -1;
     j++;
   }
