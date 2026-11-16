@@ -143,7 +143,7 @@ function unescapeStr(s) {
 // reference &name;, or a numeric reference with at most 7 decimal or 6
 // hex digits followed by ';'.
 function escAttr(s) {
-  if (s.indexOf('&') < 0 && s.indexOf('<') < 0 && s.indexOf('>') < 0 && s.indexOf('"') < 0 && s.indexOf("'") < 0) return s;
+  if (!ESC_TEST_RE.test(s)) return s;
   const out = [];
   let start = 0;
   for (let i = 0; i < s.length; i++) {
@@ -230,24 +230,6 @@ function foldCase(s) {
 }
 
 // ---- tab / column helpers for block parsing ----
-// Columns of indentation (spaces and tabs, tab stops every 4) starting at
-// `pos` in `line`. Returns {cols, pos} where pos is the first non-space/tab.
-function indentAt(line, pos) {
-  let col = 0;
-  let i = pos;
-  while (i < line.length) {
-    const c = line.charCodeAt(i);
-    if (c === 32) {
-      col++;
-      i++;
-    } else if (c === 9) {
-      col += 4 - (col % 4);
-      i++;
-    } else break;
-  }
-  return { cols: col, pos: i };
-}
-
 // Advance `n` columns from (pos, col) in `line`. A tab that straddles
 // the target is expanded to spaces so the remainder survives.
 function advanceCols(line, pos, col, n) {
@@ -938,15 +920,24 @@ function startsWithCI(s, i, pat) {
 // </a> restores them. Reset per document in parse().
 let inLink = false;
 
-// Character classes for the inline stride loop, indexed by ASCII code:
-// 0 = plain text, 1 = always handled by a branch, 2 = autolink starter
-// (needs a word boundary, and for www/http/ftp also live extended
-// autolinks), 3 = '@' (extended autolink, needs extended autolinks live).
-// Non-ASCII characters are plain text: no inline construct starts there.
-const STRIDE_CLS = new Uint8Array(128);
-for (const c of [92, 96, 42, 95, 126, 60, 38, 91, 33, 10]) STRIDE_CLS[c] = 1;
-for (const c of [119, 104, 72, 102, 70, 109, 120]) STRIDE_CLS[c] = 2;
-STRIDE_CLS[64] = 3;
+// The stride pattern for the inline scanner: one native regex scan finds
+// the next character (or autolink prefix) that needs a branch, instead
+// of stepping through plain text one character at a time in JS. The
+// regex may stop at an autolink starter the branch then rejects (wrong
+// case, no word boundary, inside a link); the branch appends one char
+// and the scan resumes, so the result is identical to stopping only
+// where a branch can act.
+const STRIDE_RE = /[\\`*_~<&\[!@\n]|www\.|https?:\/\/|ftp:\/\/|mailto:|xmpp:/gi;
+
+// Whether a node list holds a real (non-plain) link anywhere, including
+// inside emphasis wrappers.
+function nodesHaveLink(ns) {
+  for (const nd of ns) {
+    if (nd.t === 'link' && !nd.plain) return true;
+    if (nd.children && nodesHaveLink(nd.children)) return true;
+  }
+  return false;
+}
 
 // Scans `s` left to right and builds a node list. Text runs are stored
 // raw (node.raw) and escaped (node.s); code spans, links, autolinks and
@@ -975,32 +966,14 @@ function scanInline(s, refs) {
   const n = s.length;
   let i = 0;
   while (i < n) {
-    let rs = i;
-    while (i < n) {
-      const c = s.charCodeAt(i);
-      if (c >= 128) { i++; continue; }
-      const k = STRIDE_CLS[c];
-      if (k === 0) { i++; continue; }
-      if (k === 1) break;
-      if (k === 3) {
-        if (inLink) { i++; continue; }
-        break;
-      }
-      // A possible autolink starter: stop only at a word boundary
-      // (the branch below needs one to do anything) and, for the
-      // www/http/ftp forms, only while extended autolinks are live.
-      if (inLink && c !== 109 && c !== 120) { i++; continue; }
-      if (i > 0) {
-        const p = s.charCodeAt(i - 1);
-        if (isAlphaNum(p) || p === 95 || p === 47 || p === 46) { i++; continue; }
-      }
-      break;
+    STRIDE_RE.lastIndex = i;
+    const m = STRIDE_RE.exec(s);
+    const stop = m ? m.index : n;
+    if (stop > i) {
+      buf += s.slice(i, stop);
+      i = stop;
+      if (i >= n) break;
     }
-    if (i > rs) {
-      buf += s.slice(rs, i);
-      continue;
-    }
-    if (i >= n) break;
     const code = s.charCodeAt(i);
     if (code === 92) {
       // Backslash escape, or a hard break before a newline.
@@ -1033,15 +1006,16 @@ function scanInline(s, refs) {
       let k = j;
       let close = -1;
       while (k < n) {
-        if (s.charCodeAt(k) === 96) {
-          let m = 0;
-          while (k + m < n && s.charCodeAt(k + m) === 96) m++;
-          if (m === runLen) {
-            close = k;
-            break;
-          }
-          k += m;
-        } else k++;
+        const nb = s.indexOf('`', k);
+        if (nb < 0) break;
+        k = nb;
+        let m = 0;
+        while (k + m < n && s.charCodeAt(k + m) === 96) m++;
+        if (m === runLen) {
+          close = k;
+          break;
+        }
+        k += m;
       }
       if (close < 0) {
         buf += s.slice(i, j);
@@ -1118,7 +1092,7 @@ function scanInline(s, refs) {
       let title = null;
       let end = -1;
       const hadParen = closeIdx + 1 < n && s.charCodeAt(closeIdx + 1) === 40;
-      if (linkTextBadBacktick(linkText)) {
+      if (linkText.indexOf('`') >= 0 && linkTextBadBacktick(linkText)) {
         if (hadParen && suppressDelimsUntil < closeIdx) suppressDelimsUntil = closeIdx;
         buf += s[i];
         i++;
@@ -1174,16 +1148,7 @@ function scanInline(s, refs) {
         const inner = scanInline(linkText, refs);
         inLink = savedLink;
         resolveDelims(inner);
-        let hasLink = false;
-        const walk = (ns) => {
-          for (const nd of ns) {
-            if (nd.t === 'link' && !nd.plain) { hasLink = true; return; }
-            if (nd.children) walk(nd.children);
-            if (hasLink) return;
-          }
-        };
-        walk(inner);
-        if (hasLink) {
+        if (nodesHaveLink(inner)) {
           buf += s[i];
           i++;
           continue;
@@ -1198,7 +1163,8 @@ function scanInline(s, refs) {
       // A dangling backtick run in the link text pairs in marked's mask
       // with the next same-length run after the link, hiding emphasis
       // delimiters between the link and that run (phantom code span).
-      {
+      // (No backtick in the text means no dangling run at all.)
+      if (linkText.indexOf('`') >= 0) {
         const dl = danglingBacktickLens(linkText);
         for (let q = 0; q < dl.length; q++) {
           const L = dl[q];
@@ -1646,8 +1612,9 @@ function matchAtx(line, idx) {
 }
 
 // Setext underline: 1 for '=', 2 for '-', 0 for neither. Indent must be <= 3.
-function matchSetext(line) {
-  const info = indentInfo(line);
+// `info` is a precomputed indentInfo(line), when the caller has one.
+function matchSetext(line, info) {
+  info = info || indentInfo(line);
   if (info.indent > 3) return 0;
   const c = line.charCodeAt(info.idx);
   if (c !== 61 && c !== 45) return 0;
@@ -1798,8 +1765,9 @@ function canInterruptParagraph(line, idx, lm, inListItem) {
 }
 
 // Does this line start a block that can interrupt a paragraph?
-function interruptsPara(line, inListItem) {
-  const info = indentInfo(line);
+// `info` is a precomputed indentInfo(line), when the caller has one.
+function interruptsPara(line, inListItem, info) {
+  info = info || indentInfo(line);
   if (info.indent > 3) return false;
   const idx = info.idx;
   if (matchAtx(line, idx)) return true;
@@ -1811,26 +1779,6 @@ function interruptsPara(line, inListItem) {
   const lm = matchListMarker(line, idx);
   if (lm && canInterruptParagraph(line, idx, lm, inListItem)) return true;
   return false;
-}
-
-// State of a line for lazy-continuation tracking inside a container:
-// 'blank', 'setext', 'block' (starts a new block) or 'para' (paragraph line).
-function lineState(s, inPara) {
-  if (isBlank(s)) return 'blank';
-  if (matchSetext(s)) return 'setext';
-  const info = indentInfo(s);
-  if (info.indent >= 4 && !inPara) return 'block';
-  if (info.indent <= 3) {
-    const idx = info.idx;
-    if (matchAtx(s, idx) || matchFence(s, idx)) return 'block';
-    const hb = htmlBlockStart(s, idx);
-    if (hb && hb.type <= 6) return 'block';
-    if (isThematicBreak(s, idx)) return 'block';
-    if (s.charCodeAt(idx) === 62) return 'block';
-    const lm = matchListMarker(s, idx);
-    if (lm && (!inPara || canInterruptParagraph(s, idx, lm))) return 'block';
-  }
-  return 'para';
 }
 
 // The line after a '>' marker at `idx` (indent `indent`), plus exactly
@@ -1887,6 +1835,7 @@ function paraPrefixOf(line, inPara) {
 }
 
 // Split a table row line into cells, respecting \| escapes and code spans.
+// Strides between separators with indexOf instead of stepping per character.
 function splitTableRow(line) {
   let start = 0;
   while (start < line.length && line.charCodeAt(start) === 32) start++;
@@ -1905,42 +1854,58 @@ function splitTableRow(line) {
   const cells = [];
   let cur = '';
   let i = start;
+  let segStart = start;
   while (i < end) {
-    const c = line.charCodeAt(i);
-    if (c === 92 && i + 1 < end) {
-      // In tables \| is an escaped pipe: the backslash is dropped.
-      if (line.charCodeAt(i + 1) === 124) cur += '|';
-      else cur += line[i] + line[i + 1];
-      i += 2;
+    // Nearest pipe or backslash from here (both are -1 when absent).
+    let pipe = line.indexOf('|', i);
+    if (pipe < 0 || pipe >= end) pipe = -1;
+    let bs = line.indexOf('\\', i);
+    if (bs < 0 || bs >= end) bs = -1;
+    if (pipe < 0 && bs < 0) {
+      cur += line.slice(segStart, end);
+      break;
+    }
+    if (bs >= 0 && (pipe < 0 || bs < pipe)) {
+      cur += line.slice(segStart, bs);
+      if (bs + 1 < end) {
+        // In tables \| is an escaped pipe: the backslash is dropped.
+        if (line.charCodeAt(bs + 1) === 124) cur += '|';
+        else cur += line[bs] + line[bs + 1];
+        i = bs + 2;
+      } else {
+        cur += line[bs];
+        i = bs + 1;
+      }
+      segStart = i;
       continue;
     }
     // An unescaped | is always a cell separator, even inside backticks:
     // marked does not let a code span protect a pipe in a table row.
-    if (c === 124) {
-      cells.push(cur);
-      cur = '';
-      i++;
-      continue;
-    }
-    cur += line[i];
-    i++;
+    cur += line.slice(segStart, pipe);
+    cells.push(cur);
+    cur = '';
+    i = pipe + 1;
+    segStart = i;
   }
   cells.push(cur);
-  return cells.map((cell) => {
+  for (let t = 0; t < cells.length; t++) {
+    const cell = cells[t];
     let a = 0;
     let b = cell.length;
     while (a < b && (cell.charCodeAt(a) === 32 || cell.charCodeAt(a) === 9)) a++;
     while (b > a && (cell.charCodeAt(b - 1) === 32 || cell.charCodeAt(b - 1) === 9)) b--;
-    return cell.slice(a, b);
-  });
+    cells[t] = cell.slice(a, b);
+  }
+  return cells;
 }
 
 // Alignment array (null | 'left' | 'right' | 'center') or null if the line
 // is not a table delimiter row. The row must be indented at most 3
 // columns, and it must contain a pipe or a colon: a bare run of dashes
 // with neither is a setext underline or a thematic break, not a delimiter.
-function delimiterRow(line) {
-  const info = indentInfo(line);
+// `info` is a precomputed indentInfo(line), when the caller has one.
+function delimiterRow(line, info) {
+  info = info || indentInfo(line);
   if (info.indent > 3) return null;
   if (line.indexOf('|') < 0 && line.indexOf(':') < 0) return null;
   const cells = splitTableRow(line);
@@ -2253,8 +2218,8 @@ function collectBlockquote(lines, i, i1, ctx) {
       // paragraph-interruption rule does not apply here.
       const linfo = indentInfo(line);
       if (linfo.indent <= 3 && matchListMarker(line, linfo.idx)) break;
-      if (interruptsPara(line)) break;
-      const st = matchSetext(line);
+      if (interruptsPara(line, undefined, linfo)) break;
+      const st = matchSetext(line, linfo);
       if (st !== 0) {
         // A lazy setext underline stays paragraph text. After another
         // lazy line it is indented 4 spaces so it is not read as an
@@ -2273,7 +2238,7 @@ function collectBlockquote(lines, i, i1, ctx) {
         j++;
         continue;
       }
-      const aligns = delimiterRow(line);
+      const aligns = delimiterRow(line, linfo);
       if (aligns) {
         // A lazy delimiter row makes a table only when the previous
         // line was lazy too; otherwise it stays paragraph text.
@@ -2393,7 +2358,10 @@ function parseList(lines, i, i1, ctx) {
         if (isNextItem) loose = true;
         // An empty item cannot claim lines after a blank line, but a
         // following item still continues the list.
-        const itemEmpty = itemLines.every((l) => l === '');
+        let itemEmpty = true;
+        for (let b = 0; b < itemLines.length; b++) {
+          if (itemLines[b] !== '') { itemEmpty = false; break; }
+        }
         if (isNextItem || (belongs && !itemEmpty)) {
           for (let b = k; b < m; b++) itemLines.push('');
           k = m;
@@ -2470,7 +2438,7 @@ function parseList(lines, i, i1, ctx) {
       }
       const lm2 = i2.indent <= 3 ? matchListMarker(l2, i2.idx) : null;
       if (lm2) break;
-      if (interruptsPara(l2)) break;
+      if (interruptsPara(l2, false, i2)) break;
       if (fence) {
         // A non-blank fence line below the content indent ends the
         // item only while the fence has no content yet (it stays
@@ -2697,7 +2665,8 @@ function parseBlocks(lines, i0, i1, ctx) {
         }
         break;
       }
-      const st = matchSetext(l2);
+      const info2 = indentInfo(l2);
+      const st = matchSetext(l2, info2);
       // A lazy setext underline (one added without its container
       // prefix) never converts the paragraph; it stays text.
       if (st && !(ctx.lazy && ctx.lazy.has(j))) {
@@ -2724,7 +2693,7 @@ function parseBlocks(lines, i0, i1, ctx) {
         done = true;
         break;
       }
-      const aligns = delimiterRow(l2);
+      const aligns = delimiterRow(l2, info2);
       if (aligns && !(ctx.noTable && ctx.noTable.has(j))) {
         // The header is the paragraph's last line; earlier lines are a
         // separate paragraph. Check the column count against the raw
@@ -2755,7 +2724,6 @@ function parseBlocks(lines, i0, i1, ctx) {
           }
         }
       }
-      const info2 = indentInfo(l2);
       if (info2.indent <= 3) {
         // A lazy line is a paragraph continuation, never a new block.
         if (ctx.lazy && ctx.lazy.has(j)) {
